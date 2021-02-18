@@ -1,4 +1,4 @@
-module sia.tech/multisign
+module go.sia.tech/multisign
 
 go 1.15
 

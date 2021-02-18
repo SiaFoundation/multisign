@@ -401,7 +401,7 @@ func runTxnWizard() (txn types.Transaction) {
 		if update.NewFailsafe.LoadString(ask("New Failsafe Address")) != nil {
 			log.Fatal("Invalid address")
 		}
-		txn.ArbitraryData = append(txn.ArbitraryData, encoding.Marshal(update))
+		txn.ArbitraryData = append(txn.ArbitraryData, encoding.MarshalAll(types.SpecifierFoundation, update))
 	}
 
 	return txn
