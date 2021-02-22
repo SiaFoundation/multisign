@@ -434,7 +434,14 @@ func checkTxn(txn types.Transaction) {
 	fmt.Println()
 	fmt.Println("Outputs:")
 	for _, out := range txn.SiacoinOutputs {
-		fmt.Printf("  %8v to %v\n", out.Value.HumanString(), out.UnlockHash)
+		dest := "to"
+		for _, in := range txn.SiacoinInputs {
+			if in.UnlockConditions.UnlockHash() == out.UnlockHash {
+				dest = "returned to input"
+				break
+			}
+		}
+		fmt.Printf("  %8v %v %v\n", out.Value.HumanString(), dest, out.UnlockHash)
 	}
 	fmt.Println()
 	var minerFee types.Currency
