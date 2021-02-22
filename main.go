@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
@@ -35,6 +36,7 @@ Actions:
     outputs         list unspent subsidy outputs
     txn             create a transaction
     sign            add a signature to a subsidy transaction
+    check           print transaction details
     broadcast       broadcast a subsidy transaction
 `
 	versionUsage = rootUsage
@@ -71,6 +73,11 @@ optionally include a subsidy address update.
 Adds a signature to a subsidy transaction. The appropriate key is selected
 automatically from the provided seed.
 `
+	checkUsage = `Usage:
+    multisign check [file]
+
+Prints transaction details, including whether any attached signatures are valid.
+`
 	broadcastUsage = `Usage:
     multisign broadcast [file] [walrus server]
 
@@ -88,6 +95,7 @@ func main() {
 	outputsCmd := flagg.New("outputs", outputsUsage)
 	txnCmd := flagg.New("txn", txnUsage)
 	signCmd := flagg.New("sign", signUsage)
+	checkCmd := flagg.New("check", checkUsage)
 	broadcastCmd := flagg.New("broadcast", broadcastUsage)
 
 	cmd := flagg.Parse(flagg.Tree{
@@ -99,6 +107,7 @@ func main() {
 			{Cmd: outputsCmd},
 			{Cmd: txnCmd},
 			{Cmd: signCmd},
+			{Cmd: checkCmd},
 			{Cmd: broadcastCmd},
 		},
 	})
@@ -193,6 +202,13 @@ func main() {
 		if txn.StandaloneValid(types.FoundationHardforkHeight+1) == nil {
 			fmt.Println("Transaction is now fully signed.")
 		}
+
+	case checkCmd:
+		if len(args) != 1 {
+			cmd.Usage()
+			return
+		}
+		checkTxn(readTxn(args[0]))
 
 	case broadcastCmd:
 		if len(args) != 2 {
@@ -405,4 +421,96 @@ func runTxnWizard() (txn types.Transaction) {
 	}
 
 	return txn
+}
+
+func checkTxn(txn types.Transaction) {
+	fmt.Println("Transaction summary:")
+	fmt.Println()
+	fmt.Println("Inputs:")
+	for _, in := range txn.SiacoinInputs {
+		fmt.Println("  ID:  ", in.ParentID)
+		fmt.Println("  Addr:", in.UnlockConditions.UnlockHash())
+	}
+	fmt.Println()
+	fmt.Println("Outputs:")
+	for _, out := range txn.SiacoinOutputs {
+		fmt.Printf("  %8v to %v\n", out.Value.HumanString(), out.UnlockHash)
+	}
+	fmt.Println()
+	var minerFee types.Currency
+	for _, fee := range txn.MinerFees {
+		minerFee = minerFee.Add(fee)
+	}
+	fmt.Println("Miner Fee:", minerFee.HumanString())
+	fmt.Println()
+	// check for update
+	for _, arb := range txn.ArbitraryData {
+		if bytes.HasPrefix(arb, types.SpecifierFoundation[:]) {
+			var update types.FoundationUnlockHashUpdate
+			if err := encoding.Unmarshal(arb[types.SpecifierLen:], &update); err != nil {
+				fmt.Println("WARNING: transaction contains invalid Foundation unlock hash update")
+				continue
+			}
+			fmt.Println("Foundation Unlock Hash Update:")
+			fmt.Println("New Primary: ", update.NewPrimary)
+			fmt.Println("New Failsafe:", update.NewFailsafe)
+			fmt.Println()
+		} else {
+			fmt.Println("WARNING: transaction contains unrecognized arbitrary data")
+		}
+	}
+	// check for other non-standard fields
+	if len(txn.FileContracts) != 0 {
+		fmt.Println("WARNING: transaction contains file contract(s)")
+	}
+	if len(txn.FileContractRevisions) != 0 {
+		fmt.Println("WARNING: transaction contains file contract revision(s)")
+	}
+	if len(txn.StorageProofs) != 0 {
+		fmt.Println("WARNING: transaction contains storage proof(s)")
+	}
+	if len(txn.SiafundInputs) != 0 {
+		fmt.Println("WARNING: transaction contains siafund input(s)")
+	}
+	if len(txn.SiafundOutputs) != 0 {
+		fmt.Println("WARNING: transaction contains siafund output(s)")
+	}
+
+	// validate signatures
+	ucMap := make(map[crypto.Hash]types.UnlockConditions)
+	for _, in := range txn.SiacoinInputs {
+		ucMap[crypto.Hash(in.ParentID)] = in.UnlockConditions
+	}
+	for _, in := range txn.SiafundInputs {
+		ucMap[crypto.Hash(in.ParentID)] = in.UnlockConditions
+	}
+	for _, rev := range txn.FileContractRevisions {
+		ucMap[crypto.Hash(rev.ParentID)] = rev.UnlockConditions
+	}
+	fmt.Println("Signatures:")
+	for i, sig := range txn.TransactionSignatures {
+		uc, ok := ucMap[sig.ParentID]
+		if !ok {
+			fmt.Printf("  INVALID signature on %v: no transaction element with that ID\n", sig.ParentID)
+			continue
+		} else if sig.PublicKeyIndex >= uint64(len(uc.PublicKeys)) {
+			fmt.Printf("  INVALID signature on %v: public key index is out-of-bounds\n", sig.ParentID)
+			continue
+		}
+		spk := uc.PublicKeys[sig.PublicKeyIndex]
+		sigHash := txn.SigHash(i, types.FoundationHardforkHeight+1)
+		if spk.Algorithm != types.SignatureEd25519 || !ed25519hash.Verify(spk.Key, sigHash, sig.Signature) {
+			fmt.Println("  INVALID signature from key", spk)
+			fmt.Println("                          on", sig.ParentID)
+			continue
+		}
+		fmt.Println("  Valid signature from key", spk)
+		fmt.Println("                        on", sig.ParentID)
+		if !sig.CoveredFields.WholeTransaction {
+			fmt.Println("    (WARNING: signature does not cover whole transaction)")
+		}
+	}
+	if len(txn.TransactionSignatures) == 0 {
+		fmt.Println("  Transaction has no signatures")
+	}
 }
