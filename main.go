@@ -13,11 +13,11 @@ import (
 	"strconv"
 	"strings"
 
-	"gitlab.com/NebulousLabs/Sia/crypto"
-	"gitlab.com/NebulousLabs/Sia/persist"
-	"gitlab.com/NebulousLabs/Sia/types"
 	"gitlab.com/NebulousLabs/bolt"
 	"gitlab.com/NebulousLabs/encoding"
+	"go.sia.tech/siad/crypto"
+	"go.sia.tech/siad/persist"
+	"go.sia.tech/siad/types"
 	"golang.org/x/term"
 	"lukechampine.com/flagg"
 	"lukechampine.com/us/ed25519hash"
@@ -216,7 +216,7 @@ func main() {
 			return
 		}
 		txn := readTxn(args[0])
-		check(txn.StandaloneValid(types.FoundationHardforkHeight-1), "Transaction is standalone-invalid")
+		check(txn.StandaloneValid(types.FoundationHardforkHeight+1), "Transaction is standalone-invalid")
 
 		err := walrus.NewClient(args[1]).Broadcast([]types.Transaction{txn})
 		check(err, "Broadcast failed")
@@ -426,6 +426,14 @@ func runTxnWizard() (txn types.Transaction) {
 func checkTxn(txn types.Transaction) {
 	fmt.Println("Transaction summary:")
 	fmt.Println()
+	fmt.Println("ID:   ", txn.ID())
+	if err := txn.StandaloneValid(types.FoundationHardforkHeight + 1); err == nil {
+		fmt.Println("Valid: Yes")
+	} else {
+		fmt.Printf("Valid: No (%v)\n", err)
+	}
+	fmt.Println()
+
 	fmt.Println("Inputs:")
 	for _, in := range txn.SiacoinInputs {
 		fmt.Println("  ID:  ", in.ParentID)
