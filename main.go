@@ -198,7 +198,7 @@ func main() {
 			log.Fatal("Seed did not correspond to any missing signatures.")
 		}
 		writeTxn(args[0], txn)
-		fmt.Println("Signature added successfully.")
+		fmt.Println("Signature(s) added successfully.")
 		if txn.StandaloneValid(types.FoundationHardforkHeight+1) == nil {
 			fmt.Println("Transaction is now fully signed.")
 		}
@@ -279,6 +279,7 @@ func sign(txn *types.Transaction, seed wallet.Seed) bool {
 		keys[string(ed25519hash.ExtractPublicKey(sk))] = sk
 	}
 
+	signed := false
 outer:
 	for _, in := range txn.SiacoinInputs {
 		for index, spk := range in.UnlockConditions.PublicKeys {
@@ -295,11 +296,11 @@ outer:
 					CoveredFields:  types.FullCoveredFields,
 					PublicKeyIndex: uint64(index),
 				}, key)
-				return true
+				signed = true
 			}
 		}
 	}
-	return false
+	return signed
 }
 
 func foundationOutput(tx *bolt.Tx, height types.BlockHeight) (id types.SiacoinOutputID, sco types.SiacoinOutput, spent bool) {
