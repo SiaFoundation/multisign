@@ -26,19 +26,6 @@ wizard, which will prompt you for all relevant transaction details, including
 updates to the subsidy addresses (if desired). The transaction will be written
 to disk in JSON format.
 
-Provided parameters:
-- ID - id of the siacoin output which will be spent in this transaction. In wizard multiple outputs can be specified
-- UnlockConditions - JSON of rules for unlock. This JSON generated on the previous step (`multisig addr 0 2 pk1,pk2,pk3`)
-- Value - a number of siacoins will be spent in this transaction
-
-Next fill outputs:
-- Address - address to send transactions
-- Amount - a number of siacoins to send
-
-Multiple outputs can de defined in output. Difference between value in input and sum of outputs amounts will be the 
-miners fee.
-Subsidy address may be optionally set there.
-
 ## Signing a Transaction
 
 Run `multisign sign txn.json` to add one signature to the transaction stored in
