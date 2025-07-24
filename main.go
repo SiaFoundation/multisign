@@ -1,28 +1,25 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
-	"math/big"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
 
-	"gitlab.com/NebulousLabs/bolt"
-	"gitlab.com/NebulousLabs/encoding"
-	"go.sia.tech/siad/crypto"
-	"go.sia.tech/siad/persist"
-	"go.sia.tech/siad/types"
+	"go.sia.tech/core/consensus"
+	"go.sia.tech/core/types"
+	"go.sia.tech/coreutils/wallet"
+	"go.sia.tech/walletd/v2/api"
 	"golang.org/x/term"
 	"lukechampine.com/flagg"
-	"lukechampine.com/us/ed25519hash"
-	"lukechampine.com/us/wallet"
-	"lukechampine.com/walrus"
 )
 
 var (
@@ -30,37 +27,13 @@ var (
     multisign [flags] [action]
 
 Actions:
-    seed            generate a seed
-    pubkey          derive a pubkey
-    addr            derive a multisig address
-    outputs         list unspent subsidy outputs
     txn             create a transaction
     sign            add a signature to a subsidy transaction
     check           print transaction details
     broadcast       broadcast a subsidy transaction
 `
 	versionUsage = rootUsage
-	seedUsage    = `Usage:
-    multisign seed
-
-Generates a random seed.
-`
-	pubkeyUsage = `Usage:
-    multisign pubkey [key index]
-
-Derives a pubkey from a seed and a key index.
-`
-	addrUsage = `Usage:
-    multisign addr [timelock] [m] [pubkey1, pubkey2, ...]
-
-Generates a multisig address for receiving subsidies.
-`
-	outputsUsage = `Usage:
-    multisign outputs [consensus.db]
-
-Lists unspent subsidy outputs in the specified consensus set.
-`
-	txnUsage = `Usage:
+	txnUsage     = `Usage:
     multisign txn [file]
 
 Launches the transaction construction wizard. Upon answering all prompts, the
@@ -79,7 +52,7 @@ automatically from the provided seed.
 Prints transaction details, including whether any attached signatures are valid.
 `
 	broadcastUsage = `Usage:
-    multisign broadcast [file] [walrus server]
+    multisign broadcast [file]
 
 Broadcasts the provided transaction.
 `
@@ -89,10 +62,6 @@ func main() {
 	log.SetFlags(0)
 	rootCmd := flagg.Root
 	rootCmd.Usage = flagg.SimpleUsage(rootCmd, rootUsage)
-	seedCmd := flagg.New("seed", seedUsage)
-	pubkeyCmd := flagg.New("pubkey", pubkeyUsage)
-	addrCmd := flagg.New("addr", addrUsage)
-	outputsCmd := flagg.New("outputs", outputsUsage)
 	txnCmd := flagg.New("txn", txnUsage)
 	signCmd := flagg.New("sign", signUsage)
 	checkCmd := flagg.New("check", checkUsage)
@@ -101,10 +70,6 @@ func main() {
 	cmd := flagg.Parse(flagg.Tree{
 		Cmd: rootCmd,
 		Sub: []flagg.Tree{
-			{Cmd: seedCmd},
-			{Cmd: pubkeyCmd},
-			{Cmd: addrCmd},
-			{Cmd: outputsCmd},
 			{Cmd: txnCmd},
 			{Cmd: signCmd},
 			{Cmd: checkCmd},
@@ -121,64 +86,12 @@ func main() {
 		}
 		log.Println("multisign v0.1.0")
 
-	case seedCmd:
-		if len(args) != 0 {
-			cmd.Usage()
-			return
-		}
-		fmt.Println(wallet.NewSeed())
-
-	case pubkeyCmd:
-		if len(args) != 1 {
-			cmd.Usage()
-			return
-		}
-		index, err := strconv.ParseUint(args[0], 10, 32)
-		check(err, "Invalid index")
-		fmt.Println(getSeed().PublicKey(index))
-
-	case addrCmd:
-		if len(args) != 3 {
-			cmd.Usage()
-			return
-		}
-		timelock, err := strconv.ParseUint(args[0], 10, 64)
-		check(err, "Invalid timelock")
-		m, err := strconv.ParseUint(args[1], 10, 32)
-		check(err, "Invalid m")
-		var keys []types.SiaPublicKey
-		for _, s := range strings.Split(args[2], ",") {
-			var spk types.SiaPublicKey
-			err = spk.LoadString(s)
-			check(err, "Invalid pubkey")
-			keys = append(keys, spk)
-		}
-		if m > uint64(len(keys)) {
-			log.Fatal("m cannot be greater than number of keys")
-		}
-		uc := types.UnlockConditions{
-			Timelock:           types.BlockHeight(timelock),
-			SignaturesRequired: m,
-			PublicKeys:         keys,
-		}
-		js, _ := json.MarshalIndent(jsonUnlockConditions(uc), "", "  ")
-		fmt.Println(string(js))
-		fmt.Println(uc.UnlockHash())
-
-	case outputsCmd:
-		if len(args) != 1 {
-			cmd.Usage()
-			return
-		}
-		listOutputs(args[0])
-
 	case txnCmd:
 		if len(args) != 1 {
 			cmd.Usage()
 			return
 		}
-		txn := runTxnWizard()
-		writeTxn(args[0], txn)
+		writeTxn(args[0], runTxnWizard())
 		fmt.Println("Wrote unsigned transaction to", args[0])
 
 	case signCmd:
@@ -186,20 +99,13 @@ func main() {
 			cmd.Usage()
 			return
 		}
-		txn := readTxn(args[0])
-		if err := txn.StandaloneValid(types.FoundationHardforkHeight + 1); err == nil {
-			fmt.Println("Transaction is already fully signed.")
-			return
-		} else if err != types.ErrMissingSignatures {
-			log.Fatalln("Transaction is invalid:", err)
-		}
-
-		if !sign(&txn, getSeed()) {
+		set := readTxn(args[0])
+		if !sign(&set, getSeed()) {
 			log.Fatal("Seed did not correspond to any missing signatures.")
 		}
-		writeTxn(args[0], txn)
+		writeTxn(args[0], set)
 		fmt.Println("Signature(s) added successfully.")
-		if txn.StandaloneValid(types.FoundationHardforkHeight+1) == nil {
+		if validate(set) == nil {
 			fmt.Println("Transaction is now fully signed.")
 		}
 
@@ -215,28 +121,23 @@ func main() {
 			cmd.Usage()
 			return
 		}
-		txn := readTxn(args[0])
-		check(txn.StandaloneValid(types.FoundationHardforkHeight+1), "Transaction is standalone-invalid")
-
-		err := walrus.NewClient(args[1]).Broadcast([]types.Transaction{txn})
+		js, err := os.ReadFile(args[0])
+		check(err, "Could not read transaction file")
+		resp, err := http.Post("http://txpool.lukechampine.com/broadcast", "application/json", bytes.NewReader(js))
 		check(err, "Broadcast failed")
+		if resp.StatusCode != http.StatusOK {
+			errBody, _ := io.ReadAll(resp.Body)
+			log.Fatalf("Broadcast failed: %s", errBody)
+		}
+		var ids struct {
+			IDs []types.TransactionID `json:"ids"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&ids); err != nil {
+			log.Fatalf("Could not decode response: %v", err)
+		}
 		fmt.Println("Transaction broadcast successfully.")
-		fmt.Println("Transaction ID:", txn.ID())
+		fmt.Println("Transaction ID:", ids.IDs[0])
 	}
-}
-
-type jsonUnlockConditions types.UnlockConditions
-
-func (uc jsonUnlockConditions) MarshalJSON() ([]byte, error) {
-	s := struct {
-		Timelock           types.BlockHeight `json:"timelock,omitempty"`
-		PublicKeys         []string          `json:"publicKeys"`
-		SignaturesRequired uint64            `json:"signaturesRequired"`
-	}{uc.Timelock, make([]string, len(uc.PublicKeys)), uc.SignaturesRequired}
-	for i := range s.PublicKeys {
-		s.PublicKeys[i] = uc.PublicKeys[i].Algorithm.String() + ":" + hex.EncodeToString(uc.PublicKeys[i].Key)
-	}
-	return json.Marshal(s)
 }
 
 func check(err error, ctx string) {
@@ -245,93 +146,96 @@ func check(err error, ctx string) {
 	}
 }
 
-func readTxn(filename string) types.Transaction {
-	js, err := ioutil.ReadFile(filename)
-	check(err, "Could not read transaction file")
-	var txn types.Transaction
-	err = json.Unmarshal(js, &txn)
-	check(err, "Could not parse transaction file")
-	return txn
+type TransactionSet struct {
+	Basis        types.ChainIndex      `json:"basis"`
+	Transactions []types.V2Transaction `json:"transactions"`
 }
 
-func writeTxn(filename string, txn types.Transaction) {
-	js, _ := json.MarshalIndent(walrus.JSONTransaction(txn), "", "  ")
+func readTxn(filename string) (set TransactionSet) {
+	js, err := os.ReadFile(filename)
+	check(err, "Could not read transaction file")
+	err = json.Unmarshal(js, &set)
+	check(err, "Could not parse transaction file")
+	return
+}
+
+func writeTxn(filename string, set TransactionSet) {
+	js, _ := json.MarshalIndent(set, "", "  ")
 	js = append(js, '\n')
-	err := ioutil.WriteFile(filename, js, 0666)
+	err := os.WriteFile(filename, js, 0666)
 	check(err, "Could not write transaction to disk")
 }
 
-func getSeed() wallet.Seed {
+func getSeed() (seed *[32]byte) {
 	fmt.Print("Seed: ")
 	phrase, err := term.ReadPassword(int(os.Stdin.Fd()))
 	check(err, "Could not read seed phrase")
 	fmt.Println()
-	seed, err := wallet.SeedFromPhrase(string(phrase))
+	seed = new([32]byte)
+	err = wallet.SeedFromPhrase(seed, string(phrase))
 	check(err, "Invalid seed")
-	return seed
+	return
 }
 
-func sign(txn *types.Transaction, seed wallet.Seed) bool {
-	// consider first 10k keys
-	keys := make(map[string]ed25519.PrivateKey)
-	for i := uint64(0); i < 10e3; i++ {
-		sk := seed.SecretKey(i)
-		keys[string(ed25519hash.ExtractPublicKey(sk))] = sk
+func basisState(set TransactionSet) consensus.State {
+	wc := api.NewClient("https://api.siascan.com/wallet", "")
+	resp, err := wc.ConsensusCheckpointID(set.Basis.ID)
+	check(err, "Could not fetch consensus state")
+	return resp.State
+}
+
+func validate(set TransactionSet) error {
+	if len(set.Transactions) != 1 {
+		return fmt.Errorf("expected exactly one transaction in set")
 	}
+	ms := consensus.NewMidState(basisState(set))
+	if err := consensus.ValidateV2Transaction(ms, set.Transactions[0]); err != nil {
+		if strings.Contains(err.Error(), "threshold not reached") {
+			err = fmt.Errorf("missing signatures")
+		}
+		return err
+	}
+	return nil
+}
+
+func sign(set *TransactionSet, seed *[32]byte) bool {
+	cs := basisState(*set)
+
+	// consider first 10k keys
+	keys := make(map[string]types.PrivateKey)
+	for i := uint64(0); i < 10e3; i++ {
+		sk := wallet.KeyFromSeed(seed, i)
+		keys[string(sk.PublicKey().UnlockKey().Key)] = sk
+	}
+
+	if len(set.Transactions) != 1 {
+		log.Fatal("Expected exactly one transaction in set")
+	}
+	txn := set.Transactions[0]
+	sigHash := cs.InputSigHash(txn)
 
 	signed := false
 outer:
-	for _, in := range txn.SiacoinInputs {
-		for index, spk := range in.UnlockConditions.PublicKeys {
-			if key, ok := keys[string(spk.Key)]; ok {
-				// check for existing signature
-				for _, sig := range txn.TransactionSignatures {
-					if sig.ParentID == crypto.Hash(in.ParentID) && sig.PublicKeyIndex == uint64(index) {
-						continue outer
+	for i := range txn.SiacoinInputs {
+		in := &txn.SiacoinInputs[i]
+		uc, ok := in.SatisfiedPolicy.Policy.Type.(types.PolicyTypeUnlockConditions)
+		if !ok {
+			continue
+		}
+		for _, pk := range uc.PublicKeys {
+			if key, ok := keys[string(pk.Key)]; ok {
+				sig := key.SignHash(sigHash)
+				for _, existing := range in.SatisfiedPolicy.Signatures {
+					if existing == sig {
+						continue outer // already signed
 					}
 				}
-
-				wallet.AppendTransactionSignature(txn, types.TransactionSignature{
-					ParentID:       crypto.Hash(in.ParentID),
-					CoveredFields:  types.FullCoveredFields,
-					PublicKeyIndex: uint64(index),
-				}, key)
+				in.SatisfiedPolicy.Signatures = append(in.SatisfiedPolicy.Signatures, sig)
 				signed = true
 			}
 		}
 	}
 	return signed
-}
-
-func foundationOutput(tx *bolt.Tx, height types.BlockHeight) (id types.SiacoinOutputID, sco types.SiacoinOutput, spent bool) {
-	var bid types.BlockID
-	encoding.Unmarshal(tx.Bucket([]byte("BlockPath")).Get(encoding.Marshal(height)), &bid)
-	id = bid.FoundationSubsidyID()
-	spent = encoding.Unmarshal(tx.Bucket([]byte("SiacoinOutputs")).Get(id[:]), &sco) != nil
-	return
-}
-
-func listOutputs(consensusPath string) {
-	_, err := os.Stat(consensusPath)
-	check(err, "Could not open consensus.db")
-	db, err := persist.OpenDatabase(persist.Metadata{
-		Header:  "Consensus Set Database",
-		Version: "0.5.0",
-	}, consensusPath)
-	check(err, "Could not open consensus.db")
-
-	fmt.Println("Outputs:")
-	db.View(func(tx *bolt.Tx) error {
-		var currentHeight types.BlockHeight
-		encoding.Unmarshal(tx.Bucket([]byte("BlockHeight")).Get([]byte("BlockHeight")), &currentHeight)
-		for height := types.FoundationHardforkHeight; height < currentHeight; height += types.FoundationSubsidyFrequency {
-			id, sco, spent := foundationOutput(tx, height)
-			if !spent {
-				fmt.Printf("Block %6v: %v %v (%v SC)\n", height, id, sco.UnlockHash, sco.Value.Div(types.SiacoinPrecision))
-			}
-		}
-		return nil
-	})
 }
 
 func ask(prompt string) (resp string) {
@@ -340,58 +244,78 @@ func ask(prompt string) (resp string) {
 	return
 }
 
-func parseCurrency(s string, c *types.Currency) bool {
-	r, ok := new(big.Rat).SetString(strings.TrimSpace(s))
-	if !ok {
-		return false
+func unHex(s string) []byte {
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		log.Fatalf("Invalid hex string: %v", err)
 	}
-	*c = types.SiacoinPrecision.MulRat(r)
-	return true
+	return b
 }
 
-func runTxnWizard() (txn types.Transaction) {
-	// inputs
-	fmt.Println("--- Inputs ---")
-	var inputSum types.Currency
-	for {
-		idStr := ask("ID (or 'done')")
-		if idStr == "done" {
-			break
-		}
-		var in types.SiacoinInput
-		if (*crypto.Hash)(&in.ParentID).LoadString(idStr) != nil {
-			fmt.Println("Invalid ID")
-			continue
-		}
-		ucStr := ask("UnlockConditions (as JSON, no whitespace)")
-		if json.Unmarshal([]byte(ucStr), &in.UnlockConditions) != nil {
-			fmt.Println("Invalid UnlockConditions")
-			continue
-		}
-		valueStr := ask("Value (in SC)")
-		var v types.Currency
-		if !parseCurrency(valueStr, &v) {
-			fmt.Println("Invalid value")
-			continue
-		}
-		txn.SiacoinInputs = append(txn.SiacoinInputs, in)
-		inputSum = inputSum.Add(v)
+var foundationUnlockConditions = types.UnlockConditions{
+	PublicKeys: []types.UnlockKey{
+		{Algorithm: types.SpecifierEd25519, Key: unHex("8663398b3299ab679f3002ad2acc656e013c3b1cc4c5d7368b8da586c7e38f4f")},
+		{Algorithm: types.SpecifierEd25519, Key: unHex("e9949c7a7bb0b97daaa3a567f2f876663a36f9f3b7f97b7728753ab1b2dd8284")},
+	},
+	SignaturesRequired: 2,
+}
+var foundationAddress = foundationUnlockConditions.UnlockHash()
+
+func runTxnWizard() (set TransactionSet) {
+	wc := api.NewClient("https://api.siascan.com/wallet", "")
+	utxos, basis, err := wc.AddressSiacoinOutputs(foundationAddress, false, 0, 1000)
+	if err != nil {
+		log.Fatal(err)
 	}
+	set.Basis = basis
+	set.Transactions = []types.V2Transaction{{}}
+	txn := &set.Transactions[0]
+
+	fmt.Println("--- Inputs ---")
+	for i := range utxos {
+		fmt.Printf("%3v:  %8v %v\n", i, utxos[i].SiacoinOutput.Value, utxos[i].ID)
+	}
+	fmt.Print("Select indices, comma-separated: ")
+	indicesStr, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	var inputSum types.Currency
+	for _, s := range strings.Split(indicesStr, ",") {
+		i, err := strconv.Atoi(strings.TrimSpace(s))
+		if err != nil {
+			log.Fatal(err)
+		} else if i < 0 || i >= len(utxos) {
+			log.Fatal("Invalid index")
+		}
+		txn.SiacoinInputs = append(txn.SiacoinInputs, types.V2SiacoinInput{
+			Parent: utxos[i].SiacoinElement,
+			SatisfiedPolicy: types.SatisfiedPolicy{
+				Policy: types.SpendPolicy{Type: types.PolicyTypeUnlockConditions(foundationUnlockConditions)},
+			},
+		})
+		inputSum = inputSum.Add(utxos[i].SiacoinOutput.Value)
+	}
+	fmt.Println("Total value:", inputSum)
 	// outputs
 	fmt.Println("--- Outputs ---")
 	var outputSum types.Currency
+	txn.MinerFee = types.Siacoins(10)
+	outputSum = outputSum.Add(txn.MinerFee)
 	for {
 		addrStr := ask("Address (or 'done')")
 		if addrStr == "done" {
 			break
 		}
 		var out types.SiacoinOutput
-		if out.UnlockHash.LoadString(addrStr) != nil {
+		if out.Address.UnmarshalText([]byte(addrStr)) != nil {
 			fmt.Println("Invalid address")
 			continue
 		}
-		amountStr := ask("Amount (in SC)")
-		if !parseCurrency(amountStr, &out.Value) {
+		amountStr := ask("Amount (or 'all')")
+		if amountStr == "all" {
+			out.Value = inputSum.Sub(outputSum)
+			txn.SiacoinOutputs = append(txn.SiacoinOutputs, out)
+			outputSum = inputSum
+			break
+		} else if out.Value.UnmarshalText([]byte(amountStr)) != nil {
 			fmt.Println("Invalid amount")
 			continue
 		}
@@ -401,34 +325,35 @@ func runTxnWizard() (txn types.Transaction) {
 			log.Fatal("Invalid transaction: outputs exceed inputs")
 		}
 	}
-	fee := inputSum.Sub(outputSum)
-	if fee.IsZero() {
-		fmt.Println("Warning: outputs exactly equal inputs; miner fee will be zero")
-	} else {
-		fmt.Printf("Remaining input value (%v SC) will be used as miner fee.\n", fee.Div(types.SiacoinPrecision))
-		txn.MinerFees = append(txn.MinerFees, fee)
+
+	// return change to wallet
+	if change := inputSum.Sub(outputSum); !change.IsZero() {
+		txn.SiacoinOutputs = append(txn.SiacoinOutputs, types.SiacoinOutput{
+			Value:   change,
+			Address: foundationAddress,
+		})
 	}
 
-	resp := strings.ToLower(ask("Include a subsidy address update in this transaction? [y/n]"))
-	if resp == "y" || resp == "yes" {
-		var update types.FoundationUnlockHashUpdate
-		if update.NewPrimary.LoadString(ask("New Primary Address")) != nil {
+	subsidy := strings.ToLower(ask("Include a subsidy address update in this transaction? [y/n]"))
+	if subsidy == "y" || subsidy == "yes" {
+		txn.NewFoundationAddress = new(types.Address)
+		if txn.NewFoundationAddress.UnmarshalText([]byte(ask("New Address"))) != nil {
 			log.Fatal("Invalid address")
 		}
-		if update.NewFailsafe.LoadString(ask("New Failsafe Address")) != nil {
-			log.Fatal("Invalid address")
-		}
-		txn.ArbitraryData = append(txn.ArbitraryData, encoding.MarshalAll(types.SpecifierFoundation, update))
 	}
 
-	return txn
+	return
 }
 
-func checkTxn(txn types.Transaction) {
+func checkTxn(set TransactionSet) {
+	if len(set.Transactions) != 1 {
+		log.Fatal("Expected exactly one transaction in set")
+	}
+	txn := set.Transactions[0]
 	fmt.Println("Transaction summary:")
 	fmt.Println()
 	fmt.Println("ID:   ", txn.ID())
-	if err := txn.StandaloneValid(types.FoundationHardforkHeight + 1); err == nil {
+	if err := validate(set); err == nil {
 		fmt.Println("Valid: Yes")
 	} else {
 		fmt.Printf("Valid: No (%v)\n", err)
@@ -437,43 +362,27 @@ func checkTxn(txn types.Transaction) {
 
 	fmt.Println("Inputs:")
 	for _, in := range txn.SiacoinInputs {
-		fmt.Println("  ID:  ", in.ParentID)
-		fmt.Println("  Addr:", in.UnlockConditions.UnlockHash())
+		fmt.Printf("  %8v from %v\n", in.Parent.SiacoinOutput.Value, in.Parent.SiacoinOutput.Address)
 	}
 	fmt.Println()
 	fmt.Println("Outputs:")
 	for _, out := range txn.SiacoinOutputs {
 		dest := "to"
 		for _, in := range txn.SiacoinInputs {
-			if in.UnlockConditions.UnlockHash() == out.UnlockHash {
+			if in.Parent.SiacoinOutput.Address == out.Address {
 				dest = "returned to input"
 				break
 			}
 		}
-		fmt.Printf("  %8v %v %v\n", out.Value.HumanString(), dest, out.UnlockHash)
+		fmt.Printf("  %8v %v %v\n", out.Value, dest, out.Address)
 	}
 	fmt.Println()
-	var minerFee types.Currency
-	for _, fee := range txn.MinerFees {
-		minerFee = minerFee.Add(fee)
-	}
-	fmt.Println("Miner Fee:", minerFee.HumanString())
+	fmt.Println("Miner Fee:", txn.MinerFee)
 	fmt.Println()
 	// check for update
-	for _, arb := range txn.ArbitraryData {
-		if bytes.HasPrefix(arb, types.SpecifierFoundation[:]) {
-			var update types.FoundationUnlockHashUpdate
-			if err := encoding.Unmarshal(arb[types.SpecifierLen:], &update); err != nil {
-				fmt.Println("WARNING: transaction contains invalid Foundation unlock hash update")
-				continue
-			}
-			fmt.Println("Foundation Unlock Hash Update:")
-			fmt.Println("New Primary: ", update.NewPrimary)
-			fmt.Println("New Failsafe:", update.NewFailsafe)
-			fmt.Println()
-		} else {
-			fmt.Println("WARNING: transaction contains unrecognized arbitrary data")
-		}
+	if txn.NewFoundationAddress != nil {
+		fmt.Println("New Foundation Address:", *txn.NewFoundationAddress)
+		fmt.Println()
 	}
 	// check for other non-standard fields
 	if len(txn.FileContracts) != 0 {
@@ -482,8 +391,8 @@ func checkTxn(txn types.Transaction) {
 	if len(txn.FileContractRevisions) != 0 {
 		fmt.Println("WARNING: transaction contains file contract revision(s)")
 	}
-	if len(txn.StorageProofs) != 0 {
-		fmt.Println("WARNING: transaction contains storage proof(s)")
+	if len(txn.FileContractResolutions) != 0 {
+		fmt.Println("WARNING: transaction contains file contract resolution(s)")
 	}
 	if len(txn.SiafundInputs) != 0 {
 		fmt.Println("WARNING: transaction contains siafund input(s)")
@@ -492,41 +401,23 @@ func checkTxn(txn types.Transaction) {
 		fmt.Println("WARNING: transaction contains siafund output(s)")
 	}
 
+	wc := api.NewClient("https://api.siascan.com/wallet", "")
+	resp, err := wc.ConsensusCheckpointID(set.Basis.ID)
+	check(err, "Could not fetch consensus state")
+	cs := resp.State
+	sigHash := cs.InputSigHash(txn)
+
 	// validate signatures
-	ucMap := make(map[crypto.Hash]types.UnlockConditions)
-	for _, in := range txn.SiacoinInputs {
-		ucMap[crypto.Hash(in.ParentID)] = in.UnlockConditions
-	}
-	for _, in := range txn.SiafundInputs {
-		ucMap[crypto.Hash(in.ParentID)] = in.UnlockConditions
-	}
-	for _, rev := range txn.FileContractRevisions {
-		ucMap[crypto.Hash(rev.ParentID)] = rev.UnlockConditions
-	}
 	fmt.Println("Signatures:")
-	for i, sig := range txn.TransactionSignatures {
-		uc, ok := ucMap[sig.ParentID]
-		if !ok {
-			fmt.Printf("  INVALID signature on %v: no transaction element with that ID\n", sig.ParentID)
-			continue
-		} else if sig.PublicKeyIndex >= uint64(len(uc.PublicKeys)) {
-			fmt.Printf("  INVALID signature on %v: public key index is out-of-bounds\n", sig.ParentID)
-			continue
-		}
-		spk := uc.PublicKeys[sig.PublicKeyIndex]
-		sigHash := txn.SigHash(i, types.FoundationHardforkHeight+1)
-		if spk.Algorithm != types.SignatureEd25519 || !ed25519hash.Verify(spk.Key, sigHash, sig.Signature) {
-			fmt.Println("  INVALID signature from key", spk)
-			fmt.Println("                          on", sig.ParentID)
-			continue
-		}
-		fmt.Println("  Valid signature from key", spk)
-		fmt.Println("                        on", sig.ParentID)
-		if !sig.CoveredFields.WholeTransaction {
-			fmt.Println("    (WARNING: signature does not cover whole transaction)")
+	sci := txn.SiacoinInputs[0]
+	for _, sig := range sci.SatisfiedPolicy.Signatures {
+		for _, pk := range foundationUnlockConditions.PublicKeys {
+			if ed25519.Verify(pk.Key, sigHash[:], sig[:]) {
+				fmt.Printf("    Valid signature from %v:%x\n", pk.Algorithm, pk.Key)
+			}
 		}
 	}
-	if len(txn.TransactionSignatures) == 0 {
-		fmt.Println("  Transaction has no signatures")
+	if len(sci.SatisfiedPolicy.Signatures) == 0 {
+		fmt.Println("  No signatures")
 	}
 }
