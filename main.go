@@ -117,13 +117,13 @@ func main() {
 		checkTxn(readTxn(args[0]))
 
 	case broadcastCmd:
-		if len(args) != 2 {
+		if len(args) != 1 {
 			cmd.Usage()
 			return
 		}
 		js, err := os.ReadFile(args[0])
 		check(err, "Could not read transaction file")
-		resp, err := http.Post("http://txpool.lukechampine.com/broadcast", "application/json", bytes.NewReader(js))
+		resp, err := http.Post("https://txpool.lukechampine.com/broadcast", "application/json", bytes.NewReader(js))
 		check(err, "Broadcast failed")
 		if resp.StatusCode != http.StatusOK {
 			errBody, _ := io.ReadAll(resp.Body)
